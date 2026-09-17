@@ -23,8 +23,10 @@ from typesafe_dspy.hybrid import (
     typesafeify,
     uninstall,
 )
+from typesafe_dspy.score import Score
 
 __all__ = [
+    "Score",
     "ImportedTypesafePromptFactory",
     "PredictionComparison",
     "PredictionFieldDelta",

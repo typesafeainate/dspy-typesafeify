@@ -19,13 +19,14 @@ from dspy.predict.predict import Predict, _get_type_name, _is_value_compatible_w
 from dspy.primitives.prediction import Prediction
 from dspy.signatures.signature import Signature, ensure_signature, make_signature
 from dspy.utils.constants import IS_TYPE_UNDEFINED
+from typesafe_dspy.score import Score
 
 logger = logging.getLogger(__name__)
 
 JsonValue = str | list[Any] | dict[str, Any]
 TypesafeKind = Literal["noul", "choice", "score", "disable"]
 DocumentBuilder = Callable[[type[Signature], dict[str, Any]], JsonValue]
-ScoreFieldSpec = Mapping[str, Sequence[int] | Mapping[int, JsonValue]]
+ScoreFieldSpec = Mapping[str, Sequence[float] | Mapping[float, JsonValue]]
 
 _TYPESAFE_ENABLED_ATTR = "__typesafe_dspy_enabled__"
 _TYPESAFE_CONFIG_KEY = "typesafe_dspy_config"
@@ -53,7 +54,7 @@ class PromptFactory(Protocol):
         self,
         *,
         instructions: JsonValue,
-        levels: Mapping[int, JsonValue],
+        levels: Mapping[float, JsonValue],
     ) -> Any:
         """Create a Typesafe Score question."""
 
@@ -93,7 +94,7 @@ class ImportedTypesafePromptFactory:
         self,
         *,
         instructions: JsonValue,
-        levels: Mapping[int, JsonValue],
+        levels: Mapping[float, JsonValue],
     ) -> Any:
         _, _, score_prompt = self._load()
         criteria = [description for _, description in sorted(levels.items())]
@@ -107,7 +108,7 @@ class TypesafeFieldConfig:
     kind: TypesafeKind | None = None
     instructions: JsonValue | None = None
     choice_options: Mapping[Any, JsonValue] | None = None
-    score_levels: Mapping[int, JsonValue] | None = None
+    score_levels: Mapping[float, JsonValue] | None = None
 
 
 @dataclass(frozen=True)
@@ -139,7 +140,7 @@ class TypesafePromptPlan:
     kind: Literal["noul", "choice", "score"]
     instructions: JsonValue
     choice_options: tuple[ChoiceOptionPlan, ...] = ()
-    score_levels: Mapping[int, JsonValue] = field(default_factory=dict)
+    score_levels: Mapping[float, JsonValue] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -493,19 +494,27 @@ def render_prediction_comparison(
 
 
 class TypesafePredict(Predict):
-    """Resolve supported typed outputs with Typesafe before falling back to DSPy."""
+    """Resolve typed outputs with Typesafe, optionally rejecting all LM fallback.
+
+    Use strict=True for a TypeSafe-only predictor.
+    """
 
     def __init__(
         self,
         signature: str | type[Signature],
         typesafe_config: TypesafeConfig,
         callbacks=None,
+        *,
+        strict: bool = False,
         **config,
     ) -> None:
         super().__init__(signature, callbacks=callbacks, **config)
+        self.strict = strict
         self.typesafe_config = typesafe_config
         self.prompt_factory = typesafe_config.prompt_factory or ImportedTypesafePromptFactory()
         self.document_builder = typesafe_config.document_builder or default_document_builder
+        if strict:
+            _validate_strict_plan(self.plan_signature(), self.config)
 
     @classmethod
     def from_predictor(
@@ -520,6 +529,7 @@ class TypesafePredict(Predict):
             predictor.signature,
             typesafe_config=typesafe_config,
             callbacks=getattr(predictor, "callbacks", None),
+            strict=getattr(predictor, "strict", False),
             **predictor.config,
         )
         wrapped.lm = predictor.lm
@@ -698,6 +708,9 @@ def _prepare_hybrid_call(
     merged_field_configs = {**typesafe_config.field_configs, **_merged_field_configs(signature, None)}
     plan = plan_signature(signature, field_configs=merged_field_configs)
 
+    if getattr(predictor, "strict", False):
+        _validate_strict_plan(plan, config)
+
     if plan.requires_dspy:
         _configure_residual_dspy(lm, config)
 
@@ -708,6 +721,27 @@ def _prepare_hybrid_call(
     _warn_for_missing_inputs(signature, kwargs)
 
     return lm, config, signature, demos, kwargs, plan
+
+
+def _validate_strict_plan(plan: SignaturePlan, config: dict[str, Any]) -> None:
+    if config:
+        raise ValueError("Strict TypesafePredict does not support LM generation options.")
+    if not plan.prompt_plans or plan.remaining_output_names:
+        raise ValueError(
+            f"Strict TypesafePredict requires every output to be handled by Typesafe. "
+            f"Unsupported outputs: {list(plan.remaining_output_names)}"
+        )
+    for prompt in plan.prompt_plans:
+        output = plan.original_signature.output_fields[prompt.field_name]
+        if output.metadata:
+            raise ValueError(f"Field `{prompt.field_name}` has unsupported output constraints.")
+        if prompt.kind == "choice" and len(prompt.choice_options) < 2:
+            raise ValueError(f"Field `{prompt.field_name}` requires at least two Choice options.")
+        if prompt.kind == "score":
+            if not isinstance(output.annotation, type) or not issubclass(output.annotation, float):
+                raise ValueError(f"Field `{prompt.field_name}` must be a float output for Score.")
+            if len(prompt.score_levels) < 2:
+                raise ValueError(f"Field `{prompt.field_name}` requires at least two Score levels.")
 
 
 def _configure_residual_dspy(lm: BaseLM | str | None, config: dict[str, Any]) -> None:
@@ -837,12 +871,17 @@ def _evaluate_typesafe(
             continue
 
         response = evaluation.answers[prompt_plan.field_name]
+        # JSON object keys are strings; SDK versions may expose integer indices.
+        probabilities_by_index = {int(index): value for index, value in response.probabilities.items()}
         score = _score_expectation_on_configured_scale(
             response.score,
             prompt_plan.score_levels,
-            response.probabilities,
+            probabilities_by_index,
         )
-        probabilities = _score_probabilities_by_anchor(response.probabilities, prompt_plan.score_levels)
+        probabilities = _score_probabilities_by_anchor(probabilities_by_index, prompt_plan.score_levels)
+        annotation = signature.output_fields[prompt_plan.field_name].annotation
+        if isinstance(annotation, type) and issubclass(annotation, Score):
+            score = annotation(score)
         resolved_outputs[prompt_plan.field_name] = score
         field_results[prompt_plan.field_name] = TypesafeFieldResult(
             kind="score",
@@ -876,8 +915,8 @@ def _build_prompt(prompt_factory: PromptFactory, prompt_plan: TypesafePromptPlan
 
 def _score_probabilities_by_anchor(
     probabilities: Mapping[int, float],
-    levels: Mapping[int, JsonValue],
-) -> Mapping[int, float]:
+    levels: Mapping[float, JsonValue],
+) -> Mapping[float, float]:
     anchors = sorted(levels)
     if all(index in probabilities for index in range(len(anchors))):
         return {
@@ -889,7 +928,7 @@ def _score_probabilities_by_anchor(
 
 def _score_expectation_on_configured_scale(
     score: float,
-    levels: Mapping[int, JsonValue],
+    levels: Mapping[float, JsonValue],
     probabilities: Mapping[int, float],
 ) -> float:
     """Preserve the configured numeric expectation across v1's positional scale."""
@@ -1009,8 +1048,8 @@ def _validate_field_configs(
 
 def _score_levels_from_spec(
     field_name: str,
-    spec: Sequence[int] | Mapping[int, JsonValue],
-) -> Mapping[int, JsonValue]:
+    spec: Sequence[float] | Mapping[float, JsonValue],
+) -> Mapping[float, JsonValue]:
     if isinstance(spec, Mapping):
         return dict(spec)
 
@@ -1025,14 +1064,14 @@ def _score_levels_from_spec(
         low, high = anchors
         if low >= high:
             raise ValueError(f"Score field `{field_name}` requires an increasing range, received {anchors}.")
-        midpoint = round((low + high) / 2)
+        midpoint = (low + high) / 2
         anchors = sorted({low, midpoint, high})
     else:
         anchors = list(anchors)
         if anchors != sorted(anchors):
             raise ValueError(f"Score field `{field_name}` must be in increasing order, received {anchors}.")
 
-    levels: dict[int, JsonValue] = {}
+    levels: dict[float, JsonValue] = {}
     for index, anchor in enumerate(anchors):
         if index == 0:
             meaning = f"`{field_name}` is near the low end of the range ({anchor})."
@@ -1040,7 +1079,7 @@ def _score_levels_from_spec(
             meaning = f"`{field_name}` is near the high end of the range ({anchor})."
         else:
             meaning = f"`{field_name}` is around the middle of the range ({anchor})."
-        levels[int(anchor)] = meaning
+        levels[anchor] = meaning
     return levels
 
 
@@ -1051,6 +1090,15 @@ def _build_prompt_plan(
     config: TypesafeFieldConfig | None,
 ) -> TypesafePromptPlan | None:
     config = config or TypesafeFieldConfig()
+    if isinstance(field.annotation, type) and issubclass(field.annotation, Score):
+        if config.kind not in (None, "score") or config.score_levels is not None or config.choice_options is not None:
+            raise ValueError(f"Field `{field_name}` has conflicting overrides for its Score annotation.")
+        return TypesafePromptPlan(
+            field_name=field_name,
+            kind="score",
+            instructions=config.instructions or _default_prompt_instructions(signature, field_name, field, "score"),
+            score_levels=dict(field.annotation.levels),
+        )
     kind = _resolve_kind(field.annotation, config)
     if kind is None or kind == "disable":
         return None

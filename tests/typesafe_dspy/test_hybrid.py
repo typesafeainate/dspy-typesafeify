@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Literal
@@ -8,6 +9,7 @@ import dspy
 from dspy.utils.dummies import DummyLM
 from typesafe_dspy import (
     PredictionComparison,
+    Score,
     TypesafeConfig,
     TypesafeFieldConfig,
     TypesafePredict,
@@ -40,7 +42,7 @@ class FakePrompt:
     kind: str
     instructions: object
     options: dict[str, object] | None = None
-    levels: dict[int, object] | None = None
+    levels: dict[float, object] | None = None
 
 
 class FakePromptFactory:
@@ -222,6 +224,192 @@ def test_typesafe_predict_does_not_require_lm_for_fully_typesafe_signature():
     assert result.owner == "api-platform"
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_strict_predict_with_levels_needs_neither_lm_nor_patching(asynchronous):
+    from dspy.signatures.field import DSPY_FIELD_ARG_NAMES
+
+    class Review(dspy.Signature):
+        text: str = dspy.InputField()
+        supported: bool = dspy.OutputField()
+        relevance: Score["Unrelated", "Partial", "Direct"] = dspy.OutputField()  # noqa: F821 - runtime rubric strings
+
+    methods = (dspy.Predict.forward, dspy.Predict.aforward, dspy.Predict._forward_preprocess)
+    field_args = list(DSPY_FIELD_ARG_NAMES)
+    client = FakeTypesafeClient(
+        FakeEvaluation(
+            nouls={"supported": 0.49},
+            scores={"relevance": {"score": 1.6, "probabilities": {"0": 0.1, "1": 0.2, "2": 0.7}}},
+        )
+    )
+    config = TypesafeConfig(client=client, model="jev-latest", prompt_factory=FakePromptFactory())
+    predict = TypesafePredict(Review, config, strict=True)
+    result = asyncio.run(predict.acall(text="Evidence")) if asynchronous else predict(text="Evidence")
+    assert result.supported is False
+    assert result.relevance == pytest.approx(1.6)
+    assert isinstance(result.relevance, Review.output_fields["relevance"].annotation)
+    assert typesafe_results(result)["relevance"].probabilities == {0: 0.1, 1: 0.2, 2: 0.7}
+    assert len(client.calls) == 1
+    assert client.calls[0]["questions"]["relevance"].levels == {0: "Unrelated", 1: "Partial", 2: "Direct"}
+    assert config.field_configs == {}  # Constructor does not mutate shared configuration.
+    assert methods == (dspy.Predict.forward, dspy.Predict.aforward, dspy.Predict._forward_preprocess)
+    assert field_args == DSPY_FIELD_ARG_NAMES
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_explicit_score_uses_distribution_on_nonuniform_anchors(asynchronous):
+    class Review(dspy.Signature):
+        text: str = dspy.InputField()
+        severity: Score[(1, "Low"), (3, "Medium"), (10, "Critical")] = dspy.OutputField()  # noqa: F821
+
+    client = FakeTypesafeClient(
+        FakeEvaluation(
+            scores={
+                "severity": {"score": 1.4, "probabilities": {"0": 0.1, "1": 0.4, "2": 0.5}},
+            }
+        )
+    )
+    config = TypesafeConfig(client=client, model="jev-latest", prompt_factory=FakePromptFactory())
+    predict = TypesafePredict(Review, config, strict=True)
+    result = asyncio.run(predict.acall(text="Evidence")) if asynchronous else predict(text="Evidence")
+    # The distribution gives 6.3; interpolating the native scalar 1.4 would give 5.8.
+    assert result.severity == pytest.approx(6.3)
+    assert isinstance(result.severity, Review.output_fields["severity"].annotation)
+    assert typesafe_results(result)["severity"].probabilities == {1: 0.1, 3: 0.4, 10: 0.5}
+    assert client.calls[0]["questions"]["severity"].levels == {1: "Low", 3: "Medium", 10: "Critical"}
+
+
+def test_field_descriptions_reach_question_instructions_and_shared_state():
+    class Review(dspy.Signature):
+        """Assess the incident report."""
+
+        report: str = dspy.InputField(desc="The reporter's observations, not verified facts.")
+        urgent: bool = dspy.OutputField(desc="Does this require immediate action?")
+        owner: Literal["support", "engineering"] = dspy.OutputField(desc="Which team should investigate?")
+        severity: Score["Cosmetic", "Blocking"] = dspy.OutputField(  # noqa: F821
+            desc="Rate functional impact, ignoring the reporter's tone."
+        )
+
+    client = FakeTypesafeClient(
+        FakeEvaluation(
+            nouls={"urgent": 0.9},
+            choices={"owner": {"choice": "option_1", "probabilities": {"option_0": 0.1, "option_1": 0.9}}},
+            scores={"severity": {"score": 0.8, "probabilities": {0: 0.2, 1: 0.8}}},
+        )
+    )
+    config = TypesafeConfig(client=client, model="jev-latest", prompt_factory=FakePromptFactory())
+    TypesafePredict(Review, config, strict=True)(report="Login fails.")
+    request = client.calls[0]
+    assert request["document"]["signature"]["inputs"]["report"]["description"] == (
+        "The reporter's observations, not verified facts."
+    )
+    for name, description in {
+        "urgent": "Does this require immediate action?",
+        "owner": "Which team should investigate?",
+        "severity": "Rate functional impact, ignoring the reporter's tone.",
+    }.items():
+        instructions = request["questions"][name].instructions
+        assert instructions["task"] == "Assess the incident report."
+        assert instructions["output_field"]["description"] == description
+        assert request["document"]["signature"]["outputs"][name]["description"] == description
+
+
+def test_strict_predict_rejects_residual_outputs_and_call_overrides_before_inference():
+    client = FakeTypesafeClient(FakeEvaluation())
+    config = TypesafeConfig(client=client, model="jev-latest", prompt_factory=FakePromptFactory())
+    for signature in ("text -> answer: str", "text -> supported: bool, score: float"):
+        with pytest.raises(ValueError, match="Unsupported outputs"):
+            TypesafePredict(signature, config, strict=True)
+    predict = TypesafePredict("text -> supported: bool", config, strict=True)
+    dspy.configure(lm=DummyLM([{"answer": "must not be used"}]))
+    with pytest.raises(ValueError, match="Unsupported outputs"):
+        predict(text="x", signature="text -> answer: str")
+    with pytest.raises(ValueError, match="generation options"):
+        predict(text="x", config={"temperature": 0.2})
+    assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    "levels",
+    [
+        (),
+        ("Only",),
+        "Low, High",
+        ("Low", "Low"),
+        ("Low", " "),
+        ("Low", 2),
+    ],
+)
+def test_invalid_levels_rejected_before_inference(levels):
+    with pytest.raises(ValueError):
+        Score[levels]
+
+
+def test_levels_reject_conflicting_configuration():
+    class Review(dspy.Signature):
+        text: str = dspy.InputField()
+        score: Score["Low", "High"] = dspy.OutputField()  # noqa: F821 - runtime rubric strings
+
+    config = TypesafeConfig(
+        client=FakeTypesafeClient(FakeEvaluation()),
+        model="jev-latest",
+        field_configs={"score": TypesafeFieldConfig(kind="score", score_levels={1: "Low", 5: "High"})},
+    )
+    with pytest.raises(ValueError, match="conflicting overrides"):
+        TypesafePredict(Review, config, strict=True)
+
+
+@pytest.mark.parametrize("entry_point", ["explicit", "global", "shared_config", "module"])
+def test_score_composes_with_existing_entry_points(entry_point):
+    @typesafeify(
+        fields={"relevance": TypesafeFieldConfig(instructions="Evaluate only the cited evidence.")},
+        score_fields={"severity": {0.5: "Minor", 2.5: "Major"}},
+    )
+    class Review(dspy.Signature):
+        text: str = dspy.InputField()
+        relevance: Score["Unrelated", "Direct"] = dspy.OutputField()  # noqa: F821
+        severity: float = dspy.OutputField()
+
+    client = FakeTypesafeClient(
+        FakeEvaluation(
+            scores={
+                "relevance": {"score": 0.8, "probabilities": {0: 0.2, 1: 0.8}},
+                "severity": {"score": 0.3, "probabilities": {0: 0.7, 1: 0.3}},
+            }
+        )
+    )
+    config_args = {"client": client, "model": "jev-latest", "prompt_factory": FakePromptFactory()}
+    if entry_point in ("global", "shared_config"):
+        config = configure_typesafe(**config_args)
+    else:
+        config = TypesafeConfig(**config_args)
+
+    if entry_point == "global":
+        predict = dspy.Predict(Review)
+    elif entry_point == "module":
+
+        class ReviewProgram(dspy.Module):
+            def __init__(self):
+                super().__init__()
+                self.review = dspy.Predict(Review)
+
+            def forward(self, **kwargs):
+                return self.review(**kwargs)
+
+        predict = enable_typesafe(ReviewProgram(), typesafe_config=config)
+    else:
+        predict = TypesafePredict(Review, typesafe_config=config, strict=True)
+
+    result = predict(text="Evidence")
+    assert isinstance(result.relevance, Review.output_fields["relevance"].annotation)
+    assert result.relevance == pytest.approx(0.8)
+    assert result.severity == pytest.approx(1.1)
+    assert typesafe_results(result)["severity"].probabilities == {0.5: 0.7, 2.5: 0.3}
+    assert len(client.calls) == 1
+    questions = client.calls[0]["questions"]
+    assert questions["relevance"].instructions == "Evaluate only the cited evidence."
+    assert questions["severity"].levels == {0.5: "Minor", 2.5: "Major"}
+
+
 def test_enable_typesafe_wraps_existing_predictors():
     class RoutingSignature(dspy.Signature):
         """Choose the initial triage route."""
@@ -293,8 +481,17 @@ def test_typesafeify_works_with_plain_dspy_predict():
     assert client.calls[0]["document"]["inputs"]["sentence"] == "I got the job offer!"
 
 
-def test_typesafeify_score_field_shorthand_builds_score_plan():
-    @typesafeify(score_fields={"review_stars": [0, 5]})
+@pytest.mark.parametrize(
+    "spec, expected_anchors, expected_score",
+    [
+        ([0, 5], (0, 2.5, 5), 3.5),
+        ([-0.5, 0.75], (-0.5, 0.125, 0.75), 0.375),
+        ([-0.5, 0.25, 0.75], (-0.5, 0.25, 0.75), 0.425),
+        ({-0.5: "Low", 0.25: "Medium", 0.75: "High"}, (-0.5, 0.25, 0.75), 0.425),
+    ],
+)
+def test_typesafeify_score_field_shorthand_builds_score_plan(spec, expected_anchors, expected_score):
+    @typesafeify(score_fields={"review_stars": spec})
     class ReviewSignature(dspy.Signature):
         """Estimate review quality."""
 
@@ -306,7 +503,26 @@ def test_typesafeify_score_field_shorthand_builds_score_plan():
     assert plan.typesafe_field_names == ("review_stars",)
     prompt_plan = plan.prompt_plans[0]
     assert prompt_plan.kind == "score"
-    assert tuple(prompt_plan.score_levels) == (0, 2, 5)
+    assert tuple(prompt_plan.score_levels) == expected_anchors
+
+    client = FakeTypesafeClient(
+        FakeEvaluation(
+            scores={
+                "review_stars": {"score": 1.4, "probabilities": {0: 0.1, 1: 0.4, 2: 0.5}},
+            }
+        )
+    )
+    config = TypesafeConfig(client=client, model="jev-latest", prompt_factory=FakePromptFactory())
+    result = TypesafePredict(ReviewSignature, config, strict=True)(review_text="Evidence")
+    assert result.review_stars == pytest.approx(expected_score)
+    assert tuple(client.calls[0]["questions"]["review_stars"].levels) == expected_anchors
+    assert typesafe_results(result)["review_stars"].probabilities == dict(
+        zip(
+            expected_anchors,
+            (0.1, 0.4, 0.5),
+            strict=True,
+        )
+    )
 
 
 def test_typesafe_score_maps_fuzzy_index_back_to_configured_scale():
