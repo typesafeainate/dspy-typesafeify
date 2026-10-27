@@ -12,7 +12,7 @@ mkdocs-redirects = "*"
 mkdocstrings = "*"
 mkdocstrings-python = "*"
 urllib3 = "==2.7.0"
-mistune = "==3.3.4"
+mistune = "==3.4.0"
 
 [requires]
 python_version = "3.12"
